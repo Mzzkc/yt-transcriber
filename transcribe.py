@@ -411,6 +411,7 @@ Examples:
     python transcribe.py "VIDEO_URL" --language ja --device cpu
     python transcribe.py "VIDEO_URL" --thicc  # word-level timestamps & confidence
     python transcribe.py "VIDEO_URL" --save-audio  # keep extracted audio file
+    python transcribe.py "VIDEO_URL" --no-transcribe  # audio only, skip Whisper
         """,
     )
     parser.add_argument("url", help="YouTube video URL or video ID")
@@ -423,9 +424,15 @@ Examples:
                         help="Include word-level timestamps and confidence scores (default: slim output)")
     parser.add_argument("--save-audio", action="store_true",
                         help="Also save the extracted audio file alongside the transcript JSON")
+    parser.add_argument("--no-transcribe", action="store_true",
+                        help="Download and extract audio only; skip transcription and JSON output (implies --save-audio)")
     parser.add_argument("--output-dir", default=".", help="Output directory (default: current)")
 
     args = parser.parse_args()
+
+    # --no-transcribe is pointless without the audio, so imply --save-audio
+    if args.no_transcribe:
+        args.save_audio = True
 
     print("=" * 60)
     print("🎬 YouTube Transcriber")
@@ -491,37 +498,41 @@ Examples:
             shutil.copy2(audio_path, saved_audio_path)
             print(f"🎵 Audio saved: {saved_audio_path}")
 
-        # --- Transcribe ---
-        try:
-            transcription = transcribe_audio(
-                audio_path,
-                model_size=args.model,
-                device=args.device,
-                language=args.language,
-                thicc=args.thicc,
-            )
-        except Exception as e:
-            print(f"❌ Transcription failed: {e}")
-            sys.exit(1)
+        # --- Transcribe (unless skipped) ---
+        transcription = None
+        if args.no_transcribe:
+            print("⏭️  Skipping transcription (--no-transcribe)")
+        else:
+            try:
+                transcription = transcribe_audio(
+                    audio_path,
+                    model_size=args.model,
+                    device=args.device,
+                    language=args.language,
+                    thicc=args.thicc,
+                )
+            except Exception as e:
+                print(f"❌ Transcription failed: {e}")
+                sys.exit(1)
 
-    # --- Build & write output ---
-    output = build_output(video_meta, transcription, thicc=args.thicc)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-
-    file_size_kb = os.path.getsize(output_path) / 1024
-
+    # --- Build & write output (unless transcription was skipped) ---
     print("\n" + "=" * 60)
     print("✅ Done!")
-    print(f"📄 Output: {output_path}")
-    print(f"   Size: {file_size_kb:.1f} KB")
+    if transcription is not None:
+        output = build_output(video_meta, transcription, thicc=args.thicc)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
+        file_size_kb = os.path.getsize(output_path) / 1024
+        print(f"📄 Output: {output_path}")
+        print(f"   Size: {file_size_kb:.1f} KB")
     if saved_audio_path:
         saved_audio_mb = os.path.getsize(saved_audio_path) / (1024 * 1024)
         print(f"🎵 Audio:  {saved_audio_path}")
         print(f"   Size: {saved_audio_mb:.1f} MB")
-    print(f"   Language: {transcription['detected_language']} ({transcription['language_probability']:.1%} confidence)")
-    print(f"   Segments: {len(transcription['segments'])}")
-    print(f"   Words: {len(transcription['full_text'].split())}")
+    if transcription is not None:
+        print(f"   Language: {transcription['detected_language']} ({transcription['language_probability']:.1%} confidence)")
+        print(f"   Segments: {len(transcription['segments'])}")
+        print(f"   Words: {len(transcription['full_text'].split())}")
     print("=" * 60)
 
 

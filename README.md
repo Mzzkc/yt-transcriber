@@ -16,8 +16,9 @@ source setup.sh
 yt-transcribe https://www.youtube.com/watch?v=VIDEO_ID
 yt-transcribe https://youtu.be/VIDEO_ID --model medium
 yt-transcribe URL --model large-v3 --language ja
-yt-transcribe URL --thicc        # word-level timestamps & confidence
-yt-transcribe URL --save-audio   # keep the extracted audio alongside the JSON
+yt-transcribe URL --thicc         # word-level timestamps & confidence
+yt-transcribe URL --save-audio    # keep the extracted audio alongside the JSON
+yt-transcribe URL --no-transcribe # audio-only: download & extract, skip transcription
 ```
 
 ## Models
