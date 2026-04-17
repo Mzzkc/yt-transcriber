@@ -253,7 +253,8 @@ def download_audio(url: str, output_dir: str) -> str:
 
 
 def transcribe_audio(audio_path: str, model_size: str = "small",
-                     device: str = "auto", language: str = None) -> dict:
+                     device: str = "auto", language: str = None,
+                     thicc: bool = False) -> dict:
     """Transcribe audio using faster-whisper."""
     from faster_whisper import WhisperModel
 
@@ -274,7 +275,9 @@ def transcribe_audio(audio_path: str, model_size: str = "small",
     model = WhisperModel(model_size, device=actual_device, compute_type=compute_type)
 
     print("🎙️  Transcribing...")
-    kwargs = {"beam_size": 5, "word_timestamps": True, "vad_filter": True}
+    kwargs = {"beam_size": 5, "vad_filter": True}
+    if thicc:
+        kwargs["word_timestamps"] = True
     if language:
         kwargs["language"] = language
 
@@ -285,7 +288,7 @@ def transcribe_audio(audio_path: str, model_size: str = "small",
 
     for seg in segments_gen:
         words = []
-        if seg.words:
+        if thicc and seg.words:
             words = [
                 {
                     "word": w.word.strip(),
@@ -407,6 +410,7 @@ Examples:
     python transcribe.py https://youtu.be/dQw4w9WgXcQ --model medium
     python transcribe.py "VIDEO_URL" --language ja --device cpu
     python transcribe.py "VIDEO_URL" --thicc  # word-level timestamps & confidence
+    python transcribe.py "VIDEO_URL" --save-audio  # keep extracted audio file
         """,
     )
     parser.add_argument("url", help="YouTube video URL or video ID")
@@ -417,6 +421,8 @@ Examples:
                         help="Compute device (default: auto)")
     parser.add_argument("--thicc", action="store_true",
                         help="Include word-level timestamps and confidence scores (default: slim output)")
+    parser.add_argument("--save-audio", action="store_true",
+                        help="Also save the extracted audio file alongside the transcript JSON")
     parser.add_argument("--output-dir", default=".", help="Output directory (default: current)")
 
     args = parser.parse_args()
@@ -461,6 +467,11 @@ Examples:
         print(f"⚠️  Could not fetch metadata (continuing anyway): {e}")
         video_meta = {"video_id": video_id, "url": args.url, "title": "Unknown"}
 
+    # --- Determine transcript output path (shared stem with audio if saved) ---
+    os.makedirs(args.output_dir, exist_ok=True)
+    output_path = generate_output_path(video_id, args.output_dir)
+    saved_audio_path = None
+
     # --- Download audio ---
     with tempfile.TemporaryDirectory(prefix="transcribe_") as tmp_dir:
         print("⬇️  Downloading audio...")
@@ -472,6 +483,14 @@ Examples:
             print(f"❌ Audio download failed: {e}")
             sys.exit(1)
 
+        # --- Save audio (before temp dir cleanup) ---
+        if args.save_audio:
+            audio_ext = os.path.splitext(audio_path)[1] or ".wav"
+            audio_stem = Path(output_path).stem.replace("transcript_", "audio_", 1)
+            saved_audio_path = os.path.join(args.output_dir, f"{audio_stem}{audio_ext}")
+            shutil.copy2(audio_path, saved_audio_path)
+            print(f"🎵 Audio saved: {saved_audio_path}")
+
         # --- Transcribe ---
         try:
             transcription = transcribe_audio(
@@ -479,6 +498,7 @@ Examples:
                 model_size=args.model,
                 device=args.device,
                 language=args.language,
+                thicc=args.thicc,
             )
         except Exception as e:
             print(f"❌ Transcription failed: {e}")
@@ -486,9 +506,6 @@ Examples:
 
     # --- Build & write output ---
     output = build_output(video_meta, transcription, thicc=args.thicc)
-    output_path = generate_output_path(video_id, args.output_dir)
-
-    os.makedirs(args.output_dir, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
 
@@ -498,6 +515,10 @@ Examples:
     print("✅ Done!")
     print(f"📄 Output: {output_path}")
     print(f"   Size: {file_size_kb:.1f} KB")
+    if saved_audio_path:
+        saved_audio_mb = os.path.getsize(saved_audio_path) / (1024 * 1024)
+        print(f"🎵 Audio:  {saved_audio_path}")
+        print(f"   Size: {saved_audio_mb:.1f} MB")
     print(f"   Language: {transcription['detected_language']} ({transcription['language_probability']:.1%} confidence)")
     print(f"   Segments: {len(transcription['segments'])}")
     print(f"   Words: {len(transcription['full_text'].split())}")
