@@ -33,6 +33,22 @@ yt-transcribe URL --no-transcribe # audio-only: download & extract, skip transcr
 
 CPU works too — just slower. GPU auto-detected.
 
+## Transcribing on another machine (optional)
+
+No GPU here, but one on another machine? Run a Whisper server there and add `--remote`:
+
+```bash
+export WHISPER_API_URL=http://gpu-box:8000
+yt-transcribe URL --remote
+yt-transcribe URL --remote --model large-v3 --thicc
+```
+
+Any server with the standard `POST /v1/audio/transcriptions` endpoint works (for example a
+[faster-whisper server](https://github.com/speaches-ai/speaches)). The audio is sent as 16 kHz mono
+FLAC — what Whisper uses anyway — so uploads stay small. Pass `--remote-url` instead of setting the
+variable, `--remote-model` if the server names its models differently, and set `WHISPER_API_KEY`
+if the server needs a key. Without `--remote`, everything runs locally as before.
+
 ## Output
 
 Slim by default. Optimized for feeding into AI pipelines.

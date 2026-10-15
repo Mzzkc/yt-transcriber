@@ -6,6 +6,7 @@ Transcribes YouTube videos to structured JSON using faster-whisper + yt-dlp.
 
 Usage:
     python transcribe.py <youtube_url> [--model small] [--language en] [--device auto]
+    python transcribe.py <youtube_url> --remote   # transcribe on a Whisper server
 
 Output:
     JSON file in current directory with collision-free naming:
@@ -27,6 +28,9 @@ import shutil
 import re
 import argparse
 import tempfile
+import urllib.error
+import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,10 +121,12 @@ def print_ffmpeg_install_instructions(os_info):
     print("=" * 60 + "\n")
 
 
-def ensure_python_deps():
+def ensure_python_deps(skip=()):
     """Install missing Python dependencies without sudo."""
     missing = []
     for import_name, pip_name in PYTHON_DEPS.items():
+        if import_name in skip:
+            continue
         try:
             __import__(import_name)
         except ImportError:
@@ -328,6 +334,143 @@ def transcribe_audio(audio_path: str, model_size: str = "small",
 
 
 # ============================================================================
+# Remote transcription (Whisper server speaking the standard
+# POST /v1/audio/transcriptions API, e.g. a faster-whisper server)
+# ============================================================================
+
+REMOTE_TIMEOUT_SECONDS = 3600
+
+
+def _remote_endpoint(base_url: str) -> str:
+    """Accept a base URL with or without a trailing /v1."""
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base + "/v1/audio/transcriptions"
+
+
+def _encode_multipart(fields, file_path: str, content_type: str):
+    """Build a multipart/form-data body (stdlib only). Fields may repeat."""
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, value in fields:
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        )
+    with open(file_path, "rb") as f:
+        data = f.read()
+    filename = os.path.basename(file_path)
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n".encode() + data + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def _compress_for_upload(audio_path: str) -> str:
+    """Whisper works on 16 kHz mono audio, so send exactly that, as lossless FLAC."""
+    out_path = os.path.splitext(audio_path)[0] + "_16k.flac"
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", audio_path,
+         "-ac", "1", "-ar", "16000", "-c:a", "flac", out_path],
+        check=True,
+    )
+    return out_path
+
+
+def _assign_words(segments: list, words: list) -> None:
+    """Attach top-level word timestamps (some servers return them only there) to segments by time."""
+    for seg in segments:
+        seg.setdefault("words", [])
+    for w in words:
+        mid = (w["start"] + w["end"]) / 2
+        for seg in segments:
+            if seg["start"] <= mid <= seg["end"]:
+                seg["words"].append(w)
+                break
+
+
+def transcribe_remote(audio_path: str, url: str, model: str, language: str = None,
+                      thicc: bool = False, api_key: str = None) -> dict:
+    """Transcribe on a Whisper server (e.g. faster-whisper on a GPU machine).
+
+    Returns the same structure as transcribe_audio().
+    """
+    upload_path = _compress_for_upload(audio_path)
+    fields = [("model", model), ("response_format", "verbose_json"), ("vad_filter", "true")]
+    if language:
+        fields.append(("language", language))
+    if thicc:
+        fields += [("timestamp_granularities[]", "segment"), ("timestamp_granularities[]", "word")]
+    body, content_type = _encode_multipart(fields, upload_path, "audio/flac")
+    headers = {"Content-Type": content_type}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    endpoint = _remote_endpoint(url)
+    print(f"🌐 Transcribing on remote server with model '{model}' "
+          f"({len(body) / (1024 * 1024):.1f} MB upload)...")
+    request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=REMOTE_TIMEOUT_SECONDS) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"remote server returned HTTP {e.code}: {detail}") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        reason = getattr(e, "reason", e)
+        raise RuntimeError(
+            f"could not reach the remote server at {endpoint} ({reason}). "
+            "Check that it is running, or drop --remote to transcribe locally."
+        ) from None
+
+    raw_segments = result.get("segments") or []
+    segments = []
+    for i, seg in enumerate(raw_segments):
+        words = []
+        if thicc:
+            words = [
+                {
+                    "word": w["word"].strip(),
+                    "start": round(w["start"], 3),
+                    "end": round(w["end"], 3),
+                    "confidence": round(w["probability"], 4) if w.get("probability") is not None else None,
+                }
+                for w in seg.get("words") or []
+            ]
+        avg_logprob = seg.get("avg_logprob")
+        no_speech = seg.get("no_speech_prob")
+        segments.append({
+            "id": seg.get("id", i + 1),
+            "start": round(seg["start"], 3),
+            "end": round(seg["end"], 3),
+            "text": seg["text"].strip(),
+            "confidence": round(avg_logprob, 4) if avg_logprob else None,
+            "no_speech_probability": round(no_speech, 4) if no_speech is not None else None,
+            "words": words,
+        })
+    if thicc and result.get("words") and not any(s["words"] for s in segments):
+        _assign_words(segments, [
+            {"word": w["word"].strip(), "start": round(w["start"], 3), "end": round(w["end"], 3),
+             "confidence": round(w["probability"], 4) if w.get("probability") is not None else None}
+            for w in result["words"]
+        ])
+
+    language_probability = result.get("language_probability")
+    return {
+        "segments": segments,
+        "full_text": " ".join(s["text"] for s in segments) if segments else result.get("text", "").strip(),
+        "detected_language": result.get("language"),
+        "language_probability": round(language_probability, 4) if language_probability is not None else None,
+        "duration_seconds": round(result.get("duration") or 0, 2),
+        "transcription_model": model,
+        "device_used": "remote",
+        "compute_type": "remote",
+    }
+
+
+# ============================================================================
 # Output
 # ============================================================================
 
@@ -412,6 +555,7 @@ Examples:
     python transcribe.py "VIDEO_URL" --thicc  # word-level timestamps & confidence
     python transcribe.py "VIDEO_URL" --save-audio  # keep extracted audio file
     python transcribe.py "VIDEO_URL" --no-transcribe  # audio only, skip Whisper
+    python transcribe.py "VIDEO_URL" --remote  # transcribe on $WHISPER_API_URL
         """,
     )
     parser.add_argument("url", help="YouTube video URL or video ID")
@@ -427,12 +571,23 @@ Examples:
     parser.add_argument("--no-transcribe", action="store_true",
                         help="Download and extract audio only; skip transcription and JSON output (implies --save-audio)")
     parser.add_argument("--output-dir", default=".", help="Output directory (default: current)")
+    parser.add_argument("--remote", action="store_true",
+                        help="Transcribe on a Whisper server (e.g. faster-whisper on another machine's GPU) "
+                             "instead of locally. URL from --remote-url or $WHISPER_API_URL")
+    parser.add_argument("--remote-url", default=os.environ.get("WHISPER_API_URL"),
+                        help="Base URL of the Whisper server (default: $WHISPER_API_URL)")
+    parser.add_argument("--remote-model", default=None,
+                        help="Model name to request from the server (default: same as --model)")
 
     args = parser.parse_args()
 
     # --no-transcribe is pointless without the audio, so imply --save-audio
     if args.no_transcribe:
         args.save_audio = True
+
+    if args.remote and not args.no_transcribe and not args.remote_url:
+        print("❌ --remote needs a server URL: pass --remote-url or set WHISPER_API_URL")
+        sys.exit(1)
 
     print("=" * 60)
     print("🎬 YouTube Transcriber")
@@ -449,8 +604,9 @@ Examples:
         sys.exit(1)
     print("✅ ffmpeg found")
 
-    # --- Install Python deps ---
-    if not ensure_python_deps():
+    # --- Install Python deps (faster-whisper is only needed for local transcription) ---
+    skip_deps = ("faster_whisper",) if (args.remote or args.no_transcribe) else ()
+    if not ensure_python_deps(skip=skip_deps):
         print("❌ Could not install required Python packages. Exiting.")
         sys.exit(1)
 
@@ -504,13 +660,23 @@ Examples:
             print("⏭️  Skipping transcription (--no-transcribe)")
         else:
             try:
-                transcription = transcribe_audio(
-                    audio_path,
-                    model_size=args.model,
-                    device=args.device,
-                    language=args.language,
-                    thicc=args.thicc,
-                )
+                if args.remote:
+                    transcription = transcribe_remote(
+                        audio_path,
+                        url=args.remote_url,
+                        model=args.remote_model or args.model,
+                        language=args.language,
+                        thicc=args.thicc,
+                        api_key=os.environ.get("WHISPER_API_KEY"),
+                    )
+                else:
+                    transcription = transcribe_audio(
+                        audio_path,
+                        model_size=args.model,
+                        device=args.device,
+                        language=args.language,
+                        thicc=args.thicc,
+                    )
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
                 sys.exit(1)
@@ -530,7 +696,9 @@ Examples:
         print(f"🎵 Audio:  {saved_audio_path}")
         print(f"   Size: {saved_audio_mb:.1f} MB")
     if transcription is not None:
-        print(f"   Language: {transcription['detected_language']} ({transcription['language_probability']:.1%} confidence)")
+        lang_prob = transcription["language_probability"]
+        lang_conf = f" ({lang_prob:.1%} confidence)" if lang_prob is not None else ""
+        print(f"   Language: {transcription['detected_language']}{lang_conf}")
         print(f"   Segments: {len(transcription['segments'])}")
         print(f"   Words: {len(transcription['full_text'].split())}")
     print("=" * 60)
